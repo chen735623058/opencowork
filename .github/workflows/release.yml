@@ -49,8 +49,14 @@ jobs:
         include:
           - os: windows-latest
             platform: windows
+          - os: macos-15-intel
+            platform: macos
+            arch: x64
+            arch_name: Intel
           - os: macos-latest
             platform: macos
+            arch: arm64
+            arch_name: Apple-Silicon
           - os: ubuntu-latest
             platform: linux
 
@@ -82,7 +88,20 @@ jobs:
         run: |
           npx tsc
           npx vite build
-          npx electron-builder --${{ matrix.platform }} --publish never
+          npx electron-builder --${{ matrix.platform }} --${{ matrix.arch }} --publish never
+
+      -
+        name: Rename artifacts for Mac
+        if: matrix.platform == 'macos'
+        run: |
+          cd release/*/ || true
+          for file in *.dmg; do
+            if [ -f "$file" ]; then
+              new_name="${file/x64/${{ matrix.arch_name }}}"
+              new_name="${new_name/arm64/${{ matrix.arch_name }}}"
+              mv "$file" "$new_name"
+            fi
+          done
 
       -
         name: Upload executables to Release
