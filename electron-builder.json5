@@ -10,7 +10,7 @@
   },
   "publish": {
     "provider": "github",
-    "owner": "MrCatAI",
+    "owner": "Safphere",
     "repo": "opencowork",
     "releaseType": "release"
   },
