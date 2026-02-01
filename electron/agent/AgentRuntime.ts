@@ -2,12 +2,16 @@ import Anthropic from '@anthropic-ai/sdk';
 import { BrowserWindow } from 'electron';
 
 import { FileSystemTools, ReadFileSchema, WriteFileSchema, ListDirSchema, RunCommandSchema } from './tools/FileSystemTools';
+import { SDKTools, EditSchema, GlobSchema, GrepSchema, WebFetchSchema, WebSearchSchema, TodoWriteSchema, AskUserQuestionSchema } from './tools/SDKTools';
 import { SkillManager } from './skills/SkillManager';
 import { MCPClientService } from './mcp/MCPClientService';
+import { AutoMemoryManager } from '../memory/AutoMemoryManager';
 import { permissionManager } from './security/PermissionManager';
 import { configStore } from '../config/ConfigStore';
+import { backgroundTaskManager, BackgroundTask } from './BackgroundTaskManager';
 import os from 'os';
 import fs from 'fs';
+import logger from '../services/Logger';
 
 // Safe commands that can be auto-approved in standard/trust modes
 const SAFE_COMMANDS = [
@@ -75,16 +79,39 @@ export class AgentRuntime {
     private history: Anthropic.MessageParam[] = [];
     private windows: BrowserWindow[] = [];
     private fsTools: FileSystemTools;
+    private sdkTools: SDKTools;
     private skillManager: SkillManager;
     private mcpService: MCPClientService;
+    private autoMemory: AutoMemoryManager;
+    private memoryContext: string = '';
     private abortController: AbortController | null = null;
     private isProcessing = false;
     private pendingConfirmations: Map<string, { resolve: (approved: boolean) => void }> = new Map();
+    private pendingQuestions: Map<string, { resolve: (answer: string) => void }> = new Map();
     private artifacts: { path: string; name: string; type: string }[] = [];
 
     private model: string;
     private maxTokens: number;
     private lastProcessTime: number = 0;
+
+    // Session isolation - track which session this agent instance is serving
+    private sessionId: string | null = null;
+
+    // ⚠️ 新增：历史版本号，防止旧数据覆盖新数据
+    private historyVersion: number = 0;
+
+    // Background task support
+    private _isBackgroundMode: boolean = false;
+    private _backgroundTaskId: string | null = null;
+    private _onProgressCallback?: (taskId: string, progress: number, message: string) => void;
+
+    // Custom system prompt (for specialized agents like Memory Assistant)
+    private customSystemPrompt: string | null = null;
+
+    // Background mode status check (used to avoid "unused variable" errors)
+    private isBackgroundTask(): boolean {
+        return this._isBackgroundMode || this._backgroundTaskId !== null || this._onProgressCallback !== undefined;
+    }
 
     constructor(apiKey: string, window: BrowserWindow, model: string = 'claude-3-5-sonnet-20241022', apiUrl: string = 'https://api.anthropic.com', maxTokens: number = 131072) {
         this.anthropic = new Anthropic({ apiKey, baseURL: apiUrl });
@@ -92,29 +119,23 @@ export class AgentRuntime {
         this.maxTokens = maxTokens;
         this.windows = [window];
         this.fsTools = new FileSystemTools();
+        this.sdkTools = new SDKTools(permissionManager, this);
         this.skillManager = new SkillManager();
         this.mcpService = new MCPClientService();
-        // Note: IPC handlers are now registered in main.ts, not here
-    }
-
-    // Add a window to receive updates (for floating ball)
-    public addWindow(win: BrowserWindow) {
-        if (!this.windows.includes(win)) {
-            this.windows.push(win);
-        }
+        this.autoMemory = new AutoMemoryManager();
     }
 
     public async initialize() {
-        console.log('Initializing AgentRuntime...');
+        logger.debug('Initializing AgentRuntime...');
         try {
             // Parallelize loading for faster startup
             await Promise.all([
                 this.skillManager.loadSkills(),
                 this.mcpService.loadClients()
             ]);
-            console.log('AgentRuntime initialized (Skills & MCP loaded)');
+            logger.debug('AgentRuntime initialized (Skills & MCP loaded)');
         } catch (error) {
-            console.error('Failed to initialize AgentRuntime:', error);
+            logger.error('Failed to initialize AgentRuntime:', error);
         }
     }
 
@@ -133,7 +154,7 @@ export class AgentRuntime {
                 baseURL: apiUrl || this.anthropic.baseURL
             });
         }
-        console.log(`[Agent] Hot-Swap: Model updated to ${model}, maxTokens: ${this.maxTokens}`);
+        logger.debug(`Hot-Swap: Model updated to ${model}, maxTokens: ${this.maxTokens}`);
     }
 
     public removeWindow(win: BrowserWindow) {
@@ -151,32 +172,352 @@ export class AgentRuntime {
 
     // Clear history for new session
     public clearHistory() {
+        // Abort any running task first to prevent stream leakage to new session
+        if (this.isProcessing) {
+            logger.debug('Aborting running task before clearing history');
+            this.abort();
+        }
+
         this.history = [];
         this.artifacts = [];
+        this.sessionId = null;  // Reset session ID
         this.notifyUpdate();
+    }
+
+    // Set custom system prompt (for specialized agents like Memory Assistant)
+    public setSystemPrompt(prompt: string | null) {
+        this.customSystemPrompt = prompt;
+        logger.debug('Custom system prompt ' + (prompt ? 'set' : 'cleared'));
+    }
+
+    /**
+     * 估算消息的 token 数量（粗略估算，约 1 token ≈ 4 字符）
+     * 这是一个简单的估算方法，不是精确计算
+     */
+    private estimateTokens(message: Anthropic.MessageParam): number {
+        let text = '';
+        if (typeof message.content === 'string') {
+            text = message.content;
+        } else if (Array.isArray(message.content)) {
+            text = message.content.map(block => {
+                if (block.type === 'text') return block.text || '';
+                if (block.type === 'image') return '[IMAGE]';
+                if (block.type === 'tool_use') {
+                    return JSON.stringify(block.input);
+                }
+                if (block.type === 'tool_result') {
+                    return typeof block.content === 'string'
+                        ? block.content
+                        : JSON.stringify(block.content);
+                }
+                return '';
+            }).join('\n');
+        }
+        // 粗略估算：1 token ≈ 4 字符（英文），中文字符约 2 倍
+        const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+        const otherChars = text.length - chineseChars;
+        return Math.ceil((chineseChars * 2 + otherChars) / 4);
+    }
+
+    /**
+     * 从消息中提取纯文本内容
+     */
+    private extractTextFromMessage(message: Anthropic.MessageParam): string | null {
+        if (typeof message.content === 'string') {
+            return message.content;
+        } else if (Array.isArray(message.content)) {
+            const textBlock = message.content.find(b => b.type === 'text');
+            return textBlock?.text || null;
+        }
+        return null;
+    }
+
+    /**
+     * 智能裁剪历史记录以适应模型的上下文窗口
+     *
+     * 策略：
+     * 1. 保留最近的 N 个消息（确保对话连贯性）
+     * 2. 保留重要的系统消息（tool_use、tool_result）
+     * 3. 保留包含决策、偏好等关键信息的用户消息
+     * 4. 移除冗余的中间对话
+     *
+     * @param messages 完整的历史消息
+     * @param maxContextTokens 最大上下文 token 数（默认 200000）
+     * @returns 裁剪后的消息数组
+     */
+    private trimHistoryToFitContext(
+        messages: Anthropic.MessageParam[],
+        maxContextTokens: number = 200000
+    ): Anthropic.MessageParam[] {
+        if (messages.length === 0) return messages;
+
+        // 第一步：保留最近的连续对话（确保连贯性）
+        const MIN_RECENT_MESSAGES = 20; // 至少保留最近 20 条消息
+        const keepRecent: Anthropic.MessageParam[] = [];
+        let recentTokens = 0;
+
+        // 从最新消息开始往前数，保留 MIN_RECENT_MESSAGES 条
+        for (let i = messages.length - 1; i >= Math.max(0, messages.length - MIN_RECENT_MESSAGES); i--) {
+            const msgTokens = this.estimateTokens(messages[i]);
+            recentTokens += msgTokens;
+            keepRecent.unshift(messages[i]);
+        }
+
+        // 如果最近消息已经超过限制，只返回这些
+        if (recentTokens >= maxContextTokens) {
+            logger.debug(`⚠️ Recent ${keepRecent.length} messages already exceed limit (~${recentTokens} tokens)`);
+            return keepRecent;
+        }
+
+        // 第二步：添加更早的消息，优先级高的先添加
+        const remainingBudget = maxContextTokens - recentTokens;
+        const olderMessages = messages.slice(0, messages.length - MIN_RECENT_MESSAGES);
+        const prioritizedOlder: Array<{ message: Anthropic.MessageParam; priority: number; tokens: number }> = [];
+
+        for (const msg of olderMessages) {
+            const tokens = this.estimateTokens(msg);
+            let priority = 0;
+
+            // 高优先级：包含工具调用的消息
+            if (Array.isArray(msg.content)) {
+                const hasToolUse = msg.content.some(block => block.type === 'tool_use');
+                const hasToolResult = msg.content.some(block => block.type === 'tool_result');
+                if (hasToolUse || hasToolResult) {
+                    priority += 10;
+                }
+            }
+
+            // 高优先级：包含关键词的用户消息（决策、偏好、学习）
+            if (msg.role === 'user') {
+                const content = this.extractTextFromMessage(msg);
+                if (content) {
+                    // 决策关键词
+                    if (/(?:决定|选择|decided|choose|使用|use|采用|adopt|应该|should)/i.test(content)) {
+                        priority += 15;
+                    }
+                    // 偏好关键词
+                    if (/(?:我喜欢|我偏好|i prefer|i like|风格|style|习惯|habit)/i.test(content)) {
+                        priority += 12;
+                    }
+                    // 知识关键词
+                    if (/(?:学到了|learned|发现|found|理解|understand)/i.test(content)) {
+                        priority += 10;
+                    }
+                    // 错误/问题
+                    if (/(?:错误|error|问题|problem|bug|失败|fail)/i.test(content)) {
+                        priority += 8;
+                    }
+                }
+            }
+
+            // 中优先级：助手的回复（通常包含重要信息）
+            if (msg.role === 'assistant') {
+                priority += 5;
+            }
+
+            prioritizedOlder.push({ message: msg, priority, tokens });
+        }
+
+        // 按优先级排序，高优先级的先加入
+        prioritizedOlder.sort((a, b) => b.priority - a.priority);
+
+        // 第三步：在预算内添加高优先级的旧消息
+        let addedTokens = 0;
+        const selectedOlder: Anthropic.MessageParam[] = [];
+
+        for (const { message, tokens } of prioritizedOlder) {
+            if (addedTokens + tokens <= remainingBudget) {
+                selectedOlder.push(message);
+                addedTokens += tokens;
+            }
+        }
+
+        // 按原始顺序重新排序
+        const allMessages = [...selectedOlder, ...keepRecent];
+        allMessages.sort((a, b) => {
+            const aIndex = messages.indexOf(a);
+            const bIndex = messages.indexOf(b);
+            return aIndex - bIndex;
+        });
+
+        if (allMessages.length < messages.length) {
+            const totalTokens = recentTokens + addedTokens;
+            logger.debug(`Smart trim: ${messages.length} → ${allMessages.length} messages (~${totalTokens} tokens, saved ${messages.length - allMessages.length} messages)`);
+
+            // ⚠️ 自动保存被移除的重要信息到记忆
+            this.saveTrimmedMemories(messages, allMessages).catch(err => {
+                logger.error('Failed to save trimmed memories:', err);
+            });
+        }
+
+        return allMessages;
+    }
+
+    /**
+     * 自动保存被裁剪掉的重要信息到记忆
+     */
+    private async saveTrimmedMemories(
+        originalMessages: Anthropic.MessageParam[],
+        trimmedMessages: Anthropic.MessageParam[]
+    ): Promise<void> {
+        try {
+            // 找出被移除的消息
+            const trimmedSet = new Set(trimmedMessages);
+            const removedMessages = originalMessages.filter(msg => !trimmedSet.has(msg));
+
+            if (removedMessages.length === 0) return;
+
+            // 提取重要信息
+            const importantContent: string[] = [];
+            for (const msg of removedMessages) {
+                if (msg.role === 'user') {
+                    const content = this.extractTextFromMessage(msg);
+                    if (content) {
+                        // 检查是否包含重要关键词
+                        if (this.isImportantContent(content)) {
+                            importantContent.push(`**User**: ${content.substring(0, 500)}`);
+                        }
+                    }
+                } else if (msg.role === 'assistant') {
+                    const content = this.extractTextFromMessage(msg);
+                    if (content && content.length < 1000) {
+                        // 只保存较短的助手回复（通常包含关键信息）
+                        importantContent.push(`**Assistant**: ${content.substring(0, 500)}`);
+                    }
+                }
+            }
+
+            if (importantContent.length === 0) return;
+
+            // 创建记忆内容
+            const timestamp = new Date().toISOString().split('T')[0];
+            const memoryContent = `
+# Conversation Memory - ${timestamp}
+
+## Trimmed Context
+The following ${removedMessages.length} messages were trimmed from context to stay within token limits.
+
+## Important Information
+
+${importantContent.join('\n\n---\n\n')}
+
+---
+*Auto-saved at: ${new Date().toISOString()}*
+`;
+
+            // 保存到记忆文件
+            await this.autoMemory.writeMemory(
+                `conversation-history/${timestamp}.md`,
+                memoryContent
+            );
+
+            logger.debug(`Auto-saved ${importantContent.length} important items to memory`);
+        } catch (error) {
+            logger.error('Failed to save trimmed memories:', error);
+        }
+    }
+
+    /**
+     * 判断内容是否重要（值得保存到记忆）
+     */
+    private isImportantContent(content: string): boolean {
+        // 检查是否包含重要关键词
+        const importantPatterns = [
+            /(?:决定|选择|decided|choose|使用|use|采用|adopt|应该|should)/i, // 决策
+            /(?:我喜欢|我偏好|i prefer|i like|风格|style|习惯|habit)/i, // 偏好
+            /(?:学到了|learned|发现|found|理解|understand|记住|remember)/i, // 学习
+            /(?:错误|error|问题|problem|bug|失败|fail|修复|fix)/i, // 问题/解决
+            /(?:重要|important|关键|key|核心|core)/i, // 关键信息
+            /(?:总结|summary|结论|conclusion)/i, // 总结
+        ];
+
+        return importantPatterns.some(pattern => pattern.test(content));
     }
 
     // Load history from saved session
-    public loadHistory(messages: Anthropic.MessageParam[]) {
+    public loadHistory(messages: Anthropic.MessageParam[], sessionId?: string) {
+        // Don't abort running task - let it continue
+        // Just update the history and sessionId
+        // The running task will continue to stream and the new history will be available after it completes
+
+        const wasProcessing = this.isProcessing;
+
         this.history = messages;
+        if (sessionId) {
+            this.sessionId = sessionId;
+            logger.debug(`Loaded history for session: ${sessionId} (wasProcessing: ${wasProcessing}, isProcessing: ${this.isProcessing})`);
+        }
         this.artifacts = [];
+
+        // Always notify update so frontend can see the loaded history
+        // If processing, the streaming will continue and the history will be updated when done
         this.notifyUpdate();
+
+        if (wasProcessing) {
+            logger.debug(`Session ${sessionId} is processing, will continue streaming to frontend`);
+        }
+    }
+
+    // Set the current session ID for this agent instance
+    public setSessionId(sessionId: string) {
+        this.sessionId = sessionId;
+        logger.debug(`Set session ID: ${sessionId}`);
+    }
+
+    // Get the current session ID
+    public getSessionId(): string | null {
+        return this.sessionId;
+    }
+
+    // Add a window to the broadcast list (used by AgentManager)
+    public addWindow(win: BrowserWindow): void {
+        if (!this.windows.includes(win)) {
+            this.windows.push(win);
+            logger.debug(`Added window to session ${this.sessionId}. Total windows: ${this.windows.length}`);
+        }
+    }
+
+    // Clean up destroyed windows from the broadcast list
+    public cleanupDestroyedWindows(): void {
+        const beforeCount = this.windows.length;
+        this.windows = this.windows.filter(win => !win.isDestroyed());
+        const afterCount = this.windows.length;
+
+        if (beforeCount !== afterCount) {
+            logger.debug(`Cleaned up ${beforeCount - afterCount} destroyed windows for session ${this.sessionId}. Remaining: ${afterCount}`);
+        }
+    }
+
+    // Check if agent is currently processing
+    public isProcessingMessage(): boolean {
+        return this.isProcessing;
+    }
+
+    // Get last process time (for cleanup)
+    public getLastProcessTime(): number {
+        return this.lastProcessTime;
     }
 
     public async processUserMessage(input: string | { content: string, images: string[] }) {
-        // Auto-recover from stuck state if > 60 seconds have passed since start
+        logger.debug(`processUserMessage called for session ${this.sessionId}`);
+
+        // Prevent concurrent message processing
         if (this.isProcessing) {
-            if (Date.now() - this.lastProcessTime > 60000) {
-                console.warn('[AgentRuntime] Detected stale processing state (60s+). Auto-resetting.');
+            const timeSinceStart = Date.now() - this.lastProcessTime;
+
+            // Auto-recover from stuck state if > 60 seconds have passed
+            if (timeSinceStart > 60000) {
+                logger.warn(`Detected stuck state for session ${this.sessionId} (${timeSinceStart}ms), auto-recovering`);
                 this.isProcessing = false;
                 this.abortController = null;
             } else {
-                throw new Error('Agent is already processing a message');
+                // Reject concurrent message within normal time window
+                logger.warn(`Message blocked: session ${this.sessionId} is already processing (${timeSinceStart}ms ago)`);
+                throw new Error('Cannot send message: another task is currently running. Please wait for it to complete or abort it first.');
             }
         }
 
         this.lastProcessTime = Date.now();
-
         this.isProcessing = true;
         this.abortController = new AbortController();
 
@@ -217,6 +558,14 @@ export class AgentRuntime {
                 userContent = blocks;
             }
 
+            // ⚠️ 自动检查相关记忆（静默，用户看不到）
+            const userMessageText = typeof input === 'string' ? input : input.content;
+            this.memoryContext = await this.autoMemory.checkRelevantMemories(userMessageText);
+
+            if (this.memoryContext && this.memoryContext.trim()) {
+                logger.debug(`Loaded relevant memories (${this.memoryContext.length} chars)`);
+            }
+
             // Add user message to history
             this.history.push({ role: 'user', content: userContent });
             this.notifyUpdate();
@@ -224,9 +573,18 @@ export class AgentRuntime {
             // Start the agent loop
             await this.runLoop();
 
+            // ⚠️ 自动保存重要信息到记忆（后台，用户看不到）
+            const lastAssistantMessage = this.history[this.history.length - 1];
+            if (lastAssistantMessage && lastAssistantMessage.role === 'assistant') {
+                const assistantResponse = JSON.stringify(lastAssistantMessage.content);
+                this.autoMemory.analyzeAndSave(userMessageText, assistantResponse).catch(err => {
+                    logger.error('[AgentRuntime] Failed to save to memory:', err);
+                });
+            }
+
         } catch (error: unknown) {
             const err = error as { status?: number; message?: string; error?: { message?: string; type?: string } };
-            console.error('Agent Loop Error:', error);
+            logger.error('Agent Loop Error:', error);
 
             // [Fix] Handle MiniMax/provider sensitive content errors gracefully
             if (err.status === 500 && (err.message?.includes('sensitive') || JSON.stringify(error).includes('1027'))) {
@@ -253,6 +611,9 @@ export class AgentRuntime {
                 this.broadcast('agent:error', `${statusInfo}${errorMsg}`);
             }
         } finally {
+            // 清空记忆上下文
+            this.memoryContext = '';
+
             // Force reload MCP clients on next run if we had an error, to ensure fresh connection
             if (this.isProcessing && this.abortController?.signal.aborted) {
                 // Was aborted, do nothing special
@@ -262,9 +623,47 @@ export class AgentRuntime {
 
             this.isProcessing = false;
             this.abortController = null;
+            logger.debug(`processUserMessage completed for session ${this.sessionId}`);
             this.notifyUpdate();
             // Broadcast done event to signal processing is complete
-            this.broadcast('agent:done', { timestamp: Date.now() });
+            this.broadcast('agent:done', {
+                timestamp: Date.now(),
+                sessionId: this.sessionId
+            });
+
+            // ⚠️ 新增：广播清空流式文本事件，确保前端显示完整历史
+            this.broadcast('agent:clear-streaming', { sessionId: this.sessionId });
+
+            // ✅ Auto-save history to SessionStore to prevent data loss
+            // This ensures history is saved even if user switches to another session
+            // ⚠️ 跳过记忆助手会话（它使用专用存储）
+            const MEMORY_ASSISTANT_SESSION_ID = 'memory-assistant-session';
+            if (this.sessionId && this.sessionId !== MEMORY_ASSISTANT_SESSION_ID && this.history.length > 0) {
+                try {
+                    const { sessionStoreV2 } = await import('../config/SessionStoreV2');
+                    const hasRealContent = this.history.some(msg => {
+                        const content = msg.content;
+                        if (typeof content === 'string') {
+                            return content.trim().length > 0;
+                        } else if (Array.isArray(content)) {
+                            return content.some(block =>
+                                block.type === 'text' ? (block.text || '').trim().length > 0 : true
+                            );
+                        }
+                        return false;
+                    });
+
+                    if (hasRealContent) {
+                        sessionStoreV2.updateSessionImmediate(this.sessionId, this.history);
+                        logger.debug(`✅ Auto-saved history to SessionStoreV2 for session ${this.sessionId}: ${this.history.length} messages`);
+                    }
+                } catch (error) {
+                    logger.error(`❌ Error auto-saving session ${this.sessionId}:`, error);
+                }
+            } else if (this.sessionId === MEMORY_ASSISTANT_SESSION_ID) {
+                // 记忆助手会话使用专用存储，在 main.ts 中处理
+                logger.debug(`ℹ️ Skipping auto-save for memory assistant session (uses dedicated storage)`);
+            }
         }
     }
 
@@ -275,7 +674,7 @@ export class AgentRuntime {
 
         while (keepGoing && iterationCount < MAX_ITERATIONS) {
             iterationCount++;
-            console.log(`[AgentRuntime] Loop iteration: ${iterationCount}`);
+            logger.debug(`Loop iteration: ${iterationCount}`);
             if (this.abortController?.signal.aborted) break;
 
             const tools: Anthropic.Tool[] = [
@@ -283,6 +682,13 @@ export class AgentRuntime {
                 WriteFileSchema,
                 ListDirSchema,
                 RunCommandSchema,
+                EditSchema,
+                GlobSchema,
+                GrepSchema,
+                WebFetchSchema,
+                WebSearchSchema,
+                TodoWriteSchema,
+                AskUserQuestionSchema,
                 ...(this.skillManager.getTools() as Anthropic.Tool[]),
                 ...(await this.mcpService.getTools() as Anthropic.Tool[])
             ];
@@ -294,7 +700,39 @@ export class AgentRuntime {
                 : '\n\nNote: No working directory has been selected yet. Ask the user to select a folder first.';
 
             const skillsDir = os.homedir() + '/.opencowork/skills';
-            const systemPrompt = `
+
+            // ⚠️ 自动检索相关记忆（仅在非记忆助手模式下）
+            let memoryContext = '';
+            if (!this.customSystemPrompt) {
+                try {
+                    // 从最近的用户消息中提取关键词用于检索
+                    const recentUserMessages = this.history
+                        .filter(m => m.role === 'user')
+                        .slice(-3); // 只看最近 3 条用户消息
+
+                    if (recentUserMessages.length > 0) {
+                        const queryText = recentUserMessages
+                            .map(m => this.extractTextFromMessage(m))
+                            .filter(Boolean)
+                            .join(' ')
+                            .substring(0, 200); // 限制查询长度
+
+                        if (queryText) {
+                            memoryContext = await this.autoMemory.checkRelevantMemories(queryText);
+                            if (memoryContext) {
+                                logger.debug('[AgentRuntime] Found relevant memories, added to context');
+                            }
+                        }
+                    }
+                } catch (error) {
+                    // 记忆检索失败不影响主流程
+                    logger.error('[AgentRuntime] Memory retrieval failed:', error);
+                }
+            }
+
+            // Use custom system prompt if set (for specialized agents like Memory Assistant)
+            // Otherwise use the default OpenCowork system prompt with memory context
+            const baseSystemPrompt = this.customSystemPrompt || `
 # OpenCowork Assistant System
 
 ## Role Definition
@@ -336,6 +774,51 @@ You are OpenCowork, an advanced AI desktop assistant designed for efficient task
 2. **MCP Integration**: Leverage available MCP servers for enhanced capabilities
 3. **Tool Prefixes**: MCP tools use namespace prefixes (e.g., \`tool_name__action\`)
 
+### ⚠️ Todo Management (Auto-Task Tracking)
+**CRITICAL**: You MUST actively manage todos for all multi-step tasks:
+
+1. **When to Create Todos**: Automatically create a todo list when:
+   - User requests a task with 3+ steps
+   - You identify a complex task requiring multiple actions
+   - Starting a new feature implementation or debugging session
+
+2. **Todo Format**:
+   \`\`\`
+   todo_write({
+     "todos": [
+       {"content": "Analyze current codebase", "activeForm": "Analyzing current codebase", "status": "in_progress"},
+       {"content": "Implement feature X", "activeForm": "Implementing feature X", "status": "pending"},
+       {"content": "Test and verify", "activeForm": "Testing and verifying", "status": "pending"}
+     ]
+   })
+   \`\`\`
+
+3. **Update Progress**:
+   - Mark todo as \`in_progress\` when starting that task
+   - Mark as \`completed\` when done
+   - Add new todos if you discover additional steps
+   - Call \`todo_write\` after EACH status change
+
+4. **Benefits**:
+   - User sees real-time progress
+   - Better context for long-running tasks
+   - Helps users understand what's happening
+
+**Example**:
+\`\`\`typescript
+// Start task
+todo_write({"todos": [
+  {"activeForm": "Reading file", "content": "Read config file", "status": "in_progress"},
+  {"activeForm": "Parsing data", "content": "Parse JSON data", "status": "pending"}
+]})
+
+// After first step completes
+todo_write({"todos": [
+  {"activeForm": "Reading file", "content": "Read config file", "status": "completed"},
+  {"activeForm": "Parsing data", "content": "Parse JSON data", "status": "in_progress"}
+]})
+\`\`\`
+
 ## Current Context
 **Working Directory**: ${workingDirContext}
 **Skills Directory**: \`${skillsDir}\`
@@ -345,29 +828,91 @@ ${this.skillManager.getSkillMetadata().map(s => `- ${s.name}: ${s.description}`)
 
 **Active MCP Servers**: ${JSON.stringify(this.mcpService.getActiveServers())}
 
+${memoryContext ? `
+**Relevant Memories**:
+${memoryContext}
+` : ''}
+
 ---
 Remember: Plan internally, execute visibly. Focus on results, not process.`;
 
-            console.log('Sending request to API...');
-            console.log('Model:', this.model);
-            console.log('Base URL:', this.anthropic.baseURL);
+            // 组合最终系统提示
+            const systemPrompt = baseSystemPrompt;
 
+            logger.debug('Sending request to API...');
+            logger.debug('Model:', this.model);
+            logger.debug('Base URL:', this.anthropic.baseURL);
+
+            // ⚠️ 默认尝试启用 Extended Thinking
+            // 不管是什么模型(Claude、DeepSeek、MiniMax、智谱等),都尝试启用 thinking 参数
+            // 如果 API 不支持,会返回错误,我们自动降级到普通模式
+            // 这样可以兼容所有支持 thinking 的模型,不会被"全部打死"
+            // ⚠️ 关键修复：裁剪历史记录以避免超过模型的上下文长度限制
+            // 默认限制为 200k tokens，为 200k 上下文的模型留出安全余量
+            const MAX_CONTEXT_TOKENS = 200000;
+            const trimmedHistory = this.trimHistoryToFitContext(this.history, MAX_CONTEXT_TOKENS);
+
+            let stream: any;
             try {
-                // Pass abort signal to the API for true interruption
-                const stream: any = await this.anthropic.messages.create({
+                const requestConfig: any = {
                     model: this.model,
                     max_tokens: this.maxTokens,
                     system: systemPrompt,
-                    messages: this.history,
+                    messages: trimmedHistory,  // 使用裁剪后的历史记录
                     stream: true,
                     tools: tools
-                } as any, {
+                };
+
+                // ✅ 默认尝试启用 thinking (所有模型)
+                requestConfig.thinking = {
+                    type: 'enabled',
+                    budget_tokens: 20000  // 思考预算:最多 20000 tokens
+                };
+                logger.debug('[AgentRuntime] Attempting to enable Extended Thinking for model:', this.model);
+
+                stream = await this.anthropic.messages.create(requestConfig, {
                     signal: this.abortController?.signal
                 });
 
+            } catch (thinkingError: any) {
+                // 如果启用 thinking 导致错误,说明模型不支持,降级到普通模式
+                if (thinkingError?.message?.includes('thinking') ||
+                    thinkingError?.message?.includes('unsupported') ||
+                    thinkingError?.message?.includes('unknown parameter') ||
+                    thinkingError?.status === 400 ||
+                    thinkingError?.status === 422) {
+                    logger.warn('[AgentRuntime] Model does not support Extended Thinking, retrying without it:', thinkingError.message);
+
+                    stream = await this.anthropic.messages.create({
+                        model: this.model,
+                        max_tokens: this.maxTokens,
+                        system: systemPrompt,
+                        messages: trimmedHistory,  // 使用裁剪后的历史记录
+                        stream: true,
+                        tools: tools
+                    }, {
+                        signal: this.abortController?.signal
+                    });
+                } else {
+                    // 其他错误直接抛出
+                    throw thinkingError;
+                }
+            }
+
+            try {
                 const finalContent: Anthropic.ContentBlock[] = [];
                 let currentToolUse: { id: string; name: string; input: string } | null = null;
                 let textBuffer = "";
+                let thinkingBuffer = "";  // ⚠️ 新增:思考内容缓冲区
+
+                // ⚠️ 关键修复：定期保存流式文本到 SessionStore，防止切换会话时丢失
+                let tokenCount = 0;
+                let lastSaveTime = Date.now();
+                const SAVE_INTERVAL_TOKENS = 10; // 每 10 个 token 保存一次
+                const SAVE_INTERVAL_MS = 1000; // 或每 1 秒保存一次
+
+                // ⚠️ 关键修复：记录用户发送消息前的历史长度，用于正确替换流式内容
+                const historyLengthBeforeStreaming = this.history.length;
 
                 for await (const chunk of stream) {
                     if (this.abortController?.signal.aborted) {
@@ -383,18 +928,53 @@ Remember: Plan internally, execute visibly. Focus on results, not process.`;
                                     textBuffer = "";
                                 }
                                 currentToolUse = { ...chunk.content_block, input: "" };
+                            } else if (chunk.content_block.type === 'thinking' || (chunk.content_block as any).type === 'reasoning') {
+                                // ⚠️ Anthropic Extended Thinking 或 DeepSeek Reasoning
+                                logger.debug('[AgentRuntime] Thinking block started');
+                                thinkingBuffer = "";
                             }
                             break;
                         case 'content_block_delta':
                             if (chunk.delta.type === 'text_delta') {
                                 textBuffer += chunk.delta.text;
+                                tokenCount++;
                                 // Broadcast streaming token to ALL windows
                                 this.broadcast('agent:stream-token', chunk.delta.text);
-                            } else if ((chunk.delta as any).type === 'reasoning_content' || (chunk.delta as any).reasoning) {
-                                // Support for native "Thinking" models (DeepSeek/compatible args)
-                                const reasoningObj = chunk.delta as any;
-                                const text = reasoningObj.text || reasoningObj.reasoning || ""; // Adapt to provider
-                                this.broadcast('agent:stream-thinking', text);
+
+                                // ⚠️ 定期保存流式内容到 SessionStore
+                                const now = Date.now();
+                                if (tokenCount % SAVE_INTERVAL_TOKENS === 0 || now - lastSaveTime > SAVE_INTERVAL_MS) {
+                                    if (this.sessionId && textBuffer.length > 0) {
+                                        try {
+                                            const { sessionStoreV2 } = await import('../config/SessionStoreV2');
+                                            // ⚠️ 关键修复：替换最后一条消息，而不是追加新消息
+                                            // 构建临时消息历史：替换最后一条 assistant 消息为当前流式内容
+                                            const partialMessage: Anthropic.MessageParam = {
+                                                role: 'assistant',
+                                                content: [{ type: 'text', text: textBuffer, citations: null }]
+                                            };
+
+                                            // 保留用户发送消息前的历史，替换/追加当前流式的部分响应
+                                            const tempHistory = [
+                                                ...this.history.slice(0, historyLengthBeforeStreaming),
+                                                partialMessage
+                                            ];
+
+                                            // 使用立即保存，确保数据持久化
+                                            sessionStoreV2.updateSessionImmediate(this.sessionId, tempHistory);
+                                            logger.debug(`Auto-saved streaming content for session ${this.sessionId}: ${textBuffer.length} chars (replaced last message)`);
+                                        } catch (error) {
+                                            logger.error(`Error saving streaming content:`, error);
+                                        }
+                                        lastSaveTime = now;
+                                    }
+                                }
+                            } else if (chunk.delta.type === 'thinking_delta' || (chunk.delta as any).type === 'reasoning_content' || (chunk.delta as any).reasoning) {
+                                // ⚠️ Anthropic Extended Thinking 或其他推理模型的思考内容
+                                const thinkingText = chunk.delta.thinking || (chunk.delta as any).text || (chunk.delta as any).reasoning || "";
+                                thinkingBuffer += thinkingText;
+                                // 实时广播思考内容给前端
+                                this.broadcast('agent:stream-thinking', thinkingText);
                             } else if (chunk.delta.type === 'input_json_delta' && currentToolUse) {
                                 currentToolUse.input += chunk.delta.partial_json;
                             }
@@ -410,7 +990,7 @@ Remember: Plan internally, execute visibly. Focus on results, not process.`;
                                         input: parsedInput
                                     });
                                 } catch (e) {
-                                    console.error("Failed to parse tool input", e);
+                                    logger.error("Failed to parse tool input", e);
                                     // Treat as a failed tool use so the model knows it messed up
                                     finalContent.push({
                                         type: 'tool_use',
@@ -420,14 +1000,22 @@ Remember: Plan internally, execute visibly. Focus on results, not process.`;
                                     });
                                 }
                                 currentToolUse = null;
+                            } else if (thinkingBuffer) {
+                                // ⚠️ Thinking block ended - 保存思考内容到 finalContent
+                                logger.debug(`🧠 Thinking block ended: ${thinkingBuffer.length} chars, adding to finalContent`);
+                                finalContent.push({ type: 'thinking', text: thinkingBuffer } as any);
+                                thinkingBuffer = "";
                             } else if (textBuffer) {
                                 // [Fix] Flush text buffer on block stop
+                                logger.debug(`content_block_stop: flushing ${textBuffer.length} chars from textBuffer to finalContent`);
                                 finalContent.push({ type: 'text', text: textBuffer, citations: null });
                                 textBuffer = "";
                             }
                             break;
                         case 'message_stop':
+                            logger.debug(`message_stop: textBuffer has ${textBuffer.length} chars`);
                             if (textBuffer) {
+                                logger.debug(`message_stop: flushing ${textBuffer.length} chars from textBuffer to finalContent`);
                                 finalContent.push({ type: 'text', text: textBuffer, citations: null });
                                 textBuffer = "";
                             }
@@ -445,17 +1033,33 @@ Remember: Plan internally, execute visibly. Focus on results, not process.`;
                         this.history.push(assistantMsg);
                         this.notifyUpdate();
                     }
-                    return; // Stop execution completely
+                    // ⚠️ 关键修复: 不要 return,让 FINALLY 块执行以保存数据
+                    // return; // ❌ 删除这行,让流程继续到 FINALLY 块
                 }
 
-                // [Fix] Ensure any remaining buffer is captured (in case message_stop didn't fire)
-                if (textBuffer) {
+                // ⚠️ 关键修复：确保 textBuffer 被完全处理
+                // message_stop 后不应该还有内容,但为了安全起见,再次检查
+                if (textBuffer && textBuffer.length > 0) {
+                    logger.warn(`⚠️ textBuffer still has ${textBuffer.length} chars after stream loop, flushing to finalContent`);
                     finalContent.push({ type: 'text', text: textBuffer, citations: null });
+                    textBuffer = "";
                 }
 
                 if (finalContent.length > 0) {
                     const assistantMsg: Anthropic.MessageParam = { role: 'assistant', content: finalContent };
                     this.history.push(assistantMsg);
+
+                    // ✅ 立即保存完整消息到 SessionStore
+                    if (this.sessionId) {
+                        try {
+                            const { sessionStoreV2 } = await import('../config/SessionStoreV2');
+                            sessionStoreV2.updateSessionImmediate(this.sessionId, this.history);
+                            logger.debug(`✅ Saved complete assistant message to SessionStoreV2 for session ${this.sessionId}: ${this.history.length} messages total`);
+                        } catch (error) {
+                            logger.error(`❌ Error saving complete message:`, error);
+                        }
+                    }
+
                     this.notifyUpdate();
 
                     const toolUses = finalContent.filter(c => c.type === 'tool_use');
@@ -464,13 +1068,13 @@ Remember: Plan internally, execute visibly. Focus on results, not process.`;
                         for (const toolUse of toolUses) {
                             // Check abort before each tool execution
                             if (this.abortController?.signal.aborted) {
-                                console.log('[AgentRuntime] Aborted before tool execution');
+                                logger.debug('[AgentRuntime] Aborted before tool execution');
                                 return;
                             }
 
                             if (toolUse.type !== 'tool_use') continue;
 
-                            console.log(`Executing tool: ${toolUse.name}`);
+                            logger.debug(`Executing tool: ${toolUse.name}`);
                             let result = "Tool execution failed or unknown tool.";
 
                             try {
@@ -509,6 +1113,15 @@ Remember: Plan internally, execute visibly. Focus on results, not process.`;
                                             const fileName = args.path.split(/[\\/]/).pop() || 'file';
                                             this.artifacts.push({ path: args.path, name: fileName, type: 'file' });
                                             this.broadcast('agent:artifact-created', { path: args.path, name: fileName, type: 'file' });
+
+                                            // ⚠️ 记录文件变更到 FileChangeTracker
+                                            if (this.sessionId) {
+                                                this.broadcast('file:record-change', {
+                                                    filePath: args.path,
+                                                    sessionId: this.sessionId,
+                                                    toolUseId: toolUse.id
+                                                });
+                                            }
                                         } else {
                                             result = 'User denied the write operation.';
                                         }
@@ -566,9 +1179,30 @@ Remember: Plan internally, execute visibly. Focus on results, not process.`;
                                     } else {
                                         result = 'User denied the command execution.';
                                     }
+                                } else if (toolUse.name === 'edit_file') {
+                                    const args = toolUse.input as { path: string; old_str: string; new_str: string; replace_all?: boolean };
+                                    result = await this.sdkTools.editFile(args);
+                                } else if (toolUse.name === 'glob') {
+                                    const args = toolUse.input as { pattern: string; cwd?: string; includePattern?: string };
+                                    result = await this.sdkTools.globFiles(args, authorizedFolders[0] || process.cwd());
+                                } else if (toolUse.name === 'grep') {
+                                    const args = toolUse.input as { pattern: string; path: string; glob?: string; caseInsensitive?: boolean; outputMode?: 'content' | 'files_with_matches' | 'count' };
+                                    result = await this.sdkTools.grepContent(args);
+                                } else if (toolUse.name === 'web_fetch') {
+                                    const args = toolUse.input as { url: string; timeout?: number };
+                                    result = await this.sdkTools.webFetch(args);
+                                } else if (toolUse.name === 'web_search') {
+                                    const args = toolUse.input as { query: string; numResults?: number };
+                                    result = await this.sdkTools.webSearch(args);
+                                } else if (toolUse.name === 'todo_write') {
+                                    const args = toolUse.input as { todos: Array<{ content: string; activeForm: string; status: string }> };
+                                    result = await this.sdkTools.todoWrite(args);
+                                } else if (toolUse.name === 'ask_user_question') {
+                                    const args = toolUse.input as { questions: Array<any> };
+                                    result = await this.sdkTools.askUserQuestion(args);
                                 } else {
                                     const skillInfo = this.skillManager.getSkillInfo(toolUse.name);
-                                    console.log(`[Runtime] Skill ${toolUse.name} info found? ${!!skillInfo} (len: ${skillInfo?.instructions?.length})`);
+                                    logger.debug(`[Runtime] Skill ${toolUse.name} info found? ${!!skillInfo} (len: ${skillInfo?.instructions?.length})`);
                                     if (skillInfo) {
                                         // Return skill content following official Claude Code Skills pattern
                                         // The model should create scripts and run them from the skill directory
@@ -647,22 +1281,22 @@ ${skillInfo.instructions}
             } catch (loopError: unknown) {
                 // Check if this is an abort error - handle gracefully
                 if (this.abortController?.signal.aborted) {
-                    console.log('[AgentRuntime] Request was aborted');
+                    logger.debug('[AgentRuntime] Request was aborted');
                     return; // Exit cleanly on abort
                 }
 
                 const loopErr = loopError as { status?: number; message?: string; name?: string };
-                console.error("Agent Loop detailed error:", loopError);
+                logger.error("Agent Loop detailed error:", loopError);
 
                 // Check for abort-related errors (different SDK versions may throw different errors)
                 if (loopErr.name === 'AbortError' || loopErr.message?.includes('abort')) {
-                    console.log('[AgentRuntime] Caught abort error');
+                    logger.debug('[AgentRuntime] Caught abort error');
                     return;
                 }
 
                 // Handle Sensitive Content Error (1027)
                 if (loopErr.status === 500 && (loopErr.message?.includes('sensitive') || JSON.stringify(loopError).includes('1027'))) {
-                    console.log("Caught sensitive content error, asking Agent to retry...");
+                    logger.debug("Caught sensitive content error, asking Agent to retry...");
 
                     // Add a system-like user message to prompt the agent to fix its output
                     this.history.push({
@@ -681,17 +1315,35 @@ ${skillInfo.instructions}
         }
     }
 
-    // Broadcast to all windows
-    private broadcast(channel: string, data: unknown) {
+    // Broadcast to all windows with session ID
+    private broadcast(channel: string, data: unknown, options?: { version?: number }) {
+        // Clean up destroyed windows before broadcasting
+        this.cleanupDestroyedWindows();
+
+        const eventData: any = {
+            sessionId: this.sessionId,
+            data: data
+        };
+
+        // ⚠️ 添加版本号（如果提供）
+        if (options?.version !== undefined) {
+            eventData.version = options.version;
+        }
+
+        // Log streaming events for debugging
+        if (channel === 'agent:stream-token') {
+            logger.debug(`Broadcasting stream-token for session ${this.sessionId}:`, typeof data === 'string' ? data.substring(0, 20) + '...' : data);
+        }
+
         for (const win of this.windows) {
             if (!win.isDestroyed()) {
-                win.webContents.send(channel, data);
+                win.webContents.send(channel, eventData);
             }
         }
     }
 
     private notifyUpdate() {
-        this.broadcast('agent:history-update', this.history);
+        this.broadcast('agent:history-update', this.history, { version: ++this.historyVersion });
     }
 
     private async requestConfirmation(tool: string, description: string, args: Record<string, unknown>): Promise<boolean> {
@@ -700,7 +1352,7 @@ ${skillInfo.instructions}
 
         // Check if permission is already granted
         if (configStore.hasPermission(tool, path)) {
-            console.log(`[AgentRuntime] Auto-approved ${tool} (saved permission)`);
+            logger.debug(`Auto-approved ${tool} (saved permission)`);
             return true;
         }
 
@@ -735,6 +1387,12 @@ ${skillInfo.instructions}
         }
         this.pendingConfirmations.clear();
 
+        // Clear any pending questions - respond with empty answers
+        for (const [, pending] of this.pendingQuestions) {
+            pending.resolve('');
+        }
+        this.pendingQuestions.clear();
+
         // Broadcast abort event to all windows
         this.broadcast('agent:aborted', {
             aborted: true,
@@ -745,7 +1403,149 @@ ${skillInfo.instructions}
         this.isProcessing = false;
         this.abortController = null;
     }
+
+    /**
+     * 添加待处理的用户问题
+     */
+    public addPendingQuestion(requestId: string, resolve: (answer: string) => void): void {
+        this.pendingQuestions.set(requestId, { resolve });
+    }
+
+    /**
+     * 处理用户对问题的回答
+     */
+    public handleUserQuestionAnswer(requestId: string, answers: string[]): void {
+        const pending = this.pendingQuestions.get(requestId);
+        if (pending && pending.resolve) {
+            // 将答案数组格式化为字符串（每个答案一行）
+            const answerText = answers.join('\n');
+            pending.resolve(answerText);
+            this.pendingQuestions.delete(requestId);
+        }
+    }
+
+    /**
+     * Set background mode for this runtime instance
+     */
+    public setBackgroundMode(
+        isBackground: boolean,
+        taskId?: string,
+        onProgress?: (taskId: string, progress: number, message: string) => void
+    ) {
+        this._isBackgroundMode = isBackground;
+        this._backgroundTaskId = taskId || null;
+        this._onProgressCallback = onProgress;
+    }
+
+    /**
+     * Process a message in background mode
+     * Returns immediately and runs the task asynchronously
+     */
+    public async processInBackground(
+        sessionId: string,
+        taskTitle: string,
+        messages: any[],
+        apiKey: string,
+        model: string,
+        apiUrl: string,
+        maxTokens: number
+    ): Promise<string> {
+        // Create a new background task
+        const task = backgroundTaskManager.createTask(sessionId, taskTitle, messages);
+
+        // Execute the task asynchronously (don't await)
+        this.executeBackgroundTask(task, apiKey, model, apiUrl, maxTokens).catch((error) => {
+            logger.error(`Background task failed:`, error);
+            backgroundTaskManager.failTask(task.id, error.message);
+        });
+
+        // Return task ID immediately
+        return task.id;
+    }
+
+    /**
+     * Execute a background task
+     */
+    private async executeBackgroundTask(
+        task: BackgroundTask,
+        apiKey: string,
+        model: string,
+        apiUrl: string,
+        maxTokens: number
+    ) {
+        // Update task status to running
+        backgroundTaskManager.startTask(task.id);
+
+        // Create a new runtime instance for this background task
+        const backgroundRuntime = new AgentRuntime(
+            apiKey,
+            this.windows[0], // Use the same window
+            model,
+            apiUrl,
+            maxTokens
+        );
+
+        // Set background mode
+        backgroundRuntime.setBackgroundMode(
+            true,
+            task.id,
+            (taskId, progress) => {
+                backgroundTaskManager.updateTaskProgress(taskId, progress);
+            }
+        );
+
+        // Initialize and load history
+        await backgroundRuntime.initialize();
+        backgroundRuntime.loadHistory(task.messages);
+
+        try {
+            // Process the message
+            await backgroundRuntime['processUserMessage'](task.messages[task.messages.length - 1]);
+
+            // Get the final history
+            const finalHistory = backgroundRuntime['history'];
+            const lastMessage = finalHistory[finalHistory.length - 1];
+
+            // Extract result text
+            let resultText = '';
+            if (typeof lastMessage.content === 'string') {
+                resultText = lastMessage.content;
+            } else if (Array.isArray(lastMessage.content)) {
+                resultText = lastMessage.content
+                    .filter((block: any) => block.type === 'text')
+                    .map((block: any) => block.text)
+                    .join('\n');
+            }
+
+            // Mark task as completed
+            backgroundTaskManager.completeTask(task.id, resultText);
+
+            // Show notification (optional)
+            this.broadcast('background-task:complete', {
+                taskId: task.id,
+                title: task.title,
+                result: resultText,
+            });
+        } catch (error: any) {
+            // Mark task as failed
+            backgroundTaskManager.failTask(task.id, error.message || 'Unknown error');
+
+            this.broadcast('background-task:failed', {
+                taskId: task.id,
+                title: task.title,
+                error: error.message,
+            });
+        } finally {
+            backgroundRuntime.dispose();
+        }
+    }
+
     public dispose() {
+        // Check if this was a background task (for cleanup/logging purposes)
+        const wasBackgroundTask = this.isBackgroundTask();
+        if (wasBackgroundTask) {
+            logger.debug('[AgentRuntime] Disposing background task');
+        }
         this.abort();
         this.mcpService.dispose();
     }
