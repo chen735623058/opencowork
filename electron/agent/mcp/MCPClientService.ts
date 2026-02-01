@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { configStore } from '../../config/ConfigStore';
+import logger from '../../services/Logger';
 
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import path from 'path';
@@ -190,7 +191,7 @@ export class MCPClientService {
     public dispose() {
         // Close all clients
         for (const client of this.clients.values()) {
-            client.close().catch(console.error);
+            client.close().catch((err) => logger.error('Failed to close MCP client:', err));
         }
         this.clients.clear();
     }
@@ -202,10 +203,10 @@ export class MCPClientService {
      * This provides the default MCP servers that should always be available
      */
     private async loadBuiltinMCPConfig(): Promise<Record<string, MCPServerConfig>> {
-        console.log('[MCP] Loading built-in MCP configuration...');
-        console.log(`[MCP] App packaged: ${app.isPackaged}`);
-        console.log(`[MCP] Resources path: ${app.isPackaged ? process.resourcesPath : 'N/A (dev mode)'}`);
-        console.log(`[MCP] CWD: ${process.cwd()}`);
+        logger.debug('[MCP] Loading built-in MCP configuration...');
+        logger.debug(`App packaged: ${app.isPackaged}`);
+        logger.debug(`Resources path: ${app.isPackaged ? process.resourcesPath : 'N/A (dev mode)'}`);
+        logger.debug(`CWD: ${process.cwd()}`);
 
         const possiblePaths: string[] = [];
 
@@ -225,21 +226,21 @@ export class MCPClientService {
         }
 
         for (const testPath of possiblePaths) {
-            console.log(`[MCP] Checking built-in config path: ${testPath}`);
+            logger.debug(`Checking built-in config path: ${testPath}`);
             try {
                 await fs.access(testPath);
                 const content = await fs.readFile(testPath, 'utf-8');
                 const config = JSON.parse(content);
-                console.log(`[MCP] ✓ Found built-in MCP config at: ${testPath}`);
-                console.log(`[MCP] Built-in servers: ${Object.keys(config.mcpServers || {}).join(', ')}`);
+                logger.debug(`✓ Found built-in MCP config at: ${testPath}`);
+                logger.debug(`Built-in servers: ${Object.keys(config.mcpServers || {}).join(', ')}`);
                 return config.mcpServers || {};
             } catch {
-                console.log(`[MCP] ✗ Built-in config not found at: ${testPath}`);
+                logger.debug(`✗ Built-in config not found at: ${testPath}`);
             }
         }
 
-        console.warn('[MCP] ⚠️  Could not find built-in MCP configuration, using hardcoded defaults');
-        console.log(`[MCP] Default servers: ${Object.keys(DEFAULT_MCP_CONFIGS).join(', ')}`);
+        logger.warn('[MCP] ⚠️  Could not find built-in MCP configuration, using hardcoded defaults');
+        logger.debug(`Default servers: ${Object.keys(DEFAULT_MCP_CONFIGS).join(', ')}`);
         return DEFAULT_MCP_CONFIGS;
     }
 
@@ -264,7 +265,7 @@ export class MCPClientService {
             masterConfig = json.mcpServers || {};
         } catch {
             // Migration: Try reading mcp.json
-            console.log('No storage found, migrating from mcp.json');
+            logger.debug('No storage found, migrating from mcp.json');
             try {
                 const activeContent = await fs.readFile(this.activeConfigPath, 'utf-8');
                 const json = JSON.parse(activeContent);
@@ -287,7 +288,7 @@ export class MCPClientService {
         for (const key of Object.keys(masterConfig)) {
             const config = masterConfig[key];
             if (config.source === 'builtin' && !builtinConfigs[key]) {
-                console.log(`[MCP] Pruning obsolete built-in server: ${key}`);
+                logger.debug(`Pruning obsolete built-in server: ${key}`);
                 delete masterConfig[key];
             }
         }
@@ -301,7 +302,7 @@ export class MCPClientService {
             if (!masterConfig[key]) {
                 // New server, add it
                 masterConfig[key] = { ...builtinConfig };
-                console.log(`[MCP] ✓ Added built-in server: ${key}`);
+                logger.debug(`✓ Added built-in server: ${key}`);
                 addedCount++;
             } else {
                 // Server exists, UPDATE it with builtin config
@@ -321,17 +322,17 @@ export class MCPClientService {
                 };
 
                 if (builtinConfig.disabled !== userDisabled) {
-                    console.log(`[MCP] ℹ️  Built-in server ${key}: builtin disabled=${builtinConfig.disabled}, user disabled=${userDisabled}`);
+                    logger.debug(`ℹ️  Built-in server ${key}: builtin disabled=${builtinConfig.disabled}, user disabled=${userDisabled}`);
                 }
                 updatedCount++;
             }
         }
 
         if (addedCount > 0) {
-            console.log(`[MCP] Added ${addedCount} built-in servers to configuration`);
+            logger.debug(`Added ${addedCount} built-in servers to configuration`);
         }
         if (updatedCount > 0) {
-            console.log(`[MCP] Updated ${updatedCount} built-in servers configuration`);
+            logger.debug(`Updated ${updatedCount} built-in servers configuration`);
         }
 
         // Save initial storage with merged defaults
@@ -347,12 +348,12 @@ export class MCPClientService {
             if (!serverConfig.name) serverConfig.name = key;
 
             // Debug log before checking disabled status
-            console.log(`[MCP] Checking ${key}: disabled=${serverConfig.disabled}`);
+            logger.debug(`Checking ${key}: disabled=${serverConfig.disabled}`);
 
             this.updateStatus(key, 'stopped', undefined, serverConfig);
 
             if (!serverConfig.disabled) {
-                console.log(`[MCP] ${key} is ENABLED, attempting to connect...`);
+                logger.debug(`${key} is ENABLED, attempting to connect...`);
                 // [Optimization] Push to array instead of awaiting sequentially
                 // Relaxed Timeout: Just log warning if slow, but don't fail.
                 // This allows background loading for slow servers without blocking.
@@ -364,21 +365,21 @@ export class MCPClientService {
                     );
 
                     try {
-                        console.log(`[MCP] Initiating connection to ${key}...`);
+                        logger.debug(`Initiating connection to ${key}...`);
                         // Race connection against timeout
                         await Promise.race([
                             this.connectToServer(key, serverConfig),
                             timeoutPromise
                         ]);
-                        console.log(`[MCP] Connection to ${key} completed.`);
+                        logger.debug(`Connection to ${key} completed.`);
                     } catch (e: any) {
-                        console.error(`[MCP] ${key} connection failed: ${e.message}`);
+                        logger.error(`${key} connection failed: ${e.message}`);
                         this.updateStatus(key, 'error', `Connection Failed: ${e.message}`);
                     }
                 };
                 connectionPromises.push(connectWithSafeTimeout());
             } else {
-                console.log(`[MCP] ${key} is DISABLED, skipping connection.`);
+                logger.debug(`${key} is DISABLED, skipping connection.`);
             }
         }
 
@@ -579,7 +580,7 @@ export class MCPClientService {
                     // Note: We're changing the command to 'cmd.exe'
                     workingConfig.args = ['/d', '/s', '/c', originalCommand, ...(workingConfig.args || [])];
                     workingConfig.command = 'cmd.exe';
-                    console.log(`[MCP] Windows fix (cmd /c): ${(config as any).command} -> cmd.exe ${workingConfig.args.join(' ')}`);
+                    logger.debug(`Windows fix (cmd /c): ${(config as any).command} -> cmd.exe ${workingConfig.args.join(' ')}`);
                 }
             }
 
@@ -645,7 +646,7 @@ export class MCPClientService {
                 }
 
                 if (missingKey) {
-                    console.log(`[MCP] Skipping connection to ${name}: Missing API Key.`);
+                    logger.debug(`Skipping connection to ${name}: Missing API Key.`);
                     this.updateStatus(name, 'error', 'Missing API Key: API Key not configured. Please check Settings.');
                     return;
                 }
@@ -655,11 +656,11 @@ export class MCPClientService {
                     return;
                 }
 
-                console.log(`[MCP] Attempting to connect to ${name} (${config.type}): ${urlStr}`);
+                logger.debug(`Attempting to connect to ${name} (${config.type}): ${urlStr}`);
 
                 try {
                     // Simplified HTTP MCP connection based on SDK source analysis
-                    console.log(`[MCP] Connecting to ${name} via HTTP/SSE: ${urlStr}`);
+                    logger.debug(`Connecting to ${name} via HTTP/SSE: ${urlStr}`);
 
                     // Dynamic import via createRequire to avoid build issues
                     try {
@@ -670,10 +671,10 @@ export class MCPClientService {
 
                         if (global.EventSource !== ES) {
                             global.EventSource = ES;
-                            console.log('[MCP] EventSource polyfilled successfully via createRequire for ' + name);
+                            logger.debug('[MCP] EventSource polyfilled successfully via createRequire for ' + name);
                         }
                     } catch (err) {
-                        console.error('[MCP] Failed to import eventsource polyfill:', err);
+                        logger.error('[MCP] Failed to import eventsource polyfill:', err);
                     }
 
 
@@ -684,17 +685,17 @@ export class MCPClientService {
 
 
                     // Debug API Key and Headers
-                    console.log(`[MCP] Preparing connection to ${name} (${urlStr})`);
+                    logger.debug(`Preparing connection to ${name} (${urlStr})`);
                     if (headers['Authorization']) {
                         const authLen = headers['Authorization'].length;
                         // Mask key for safety in logs
-                        console.log(`[MCP] Header Authorization present (length: ${authLen})`);
+                        logger.debug(`Header Authorization present (length: ${authLen})`);
                         if (authLen < 15) {
-                            console.warn(`[MCP] WARNING: Authorization header seems too short/invalid!`);
+                            logger.warn(`WARNING: Authorization header seems too short/invalid!`);
                             this.updateStatus(name, 'error', 'Invalid API Key configuration', config);
                         }
                     } else {
-                        console.warn(`[MCP] No Authorization header found for ${name}`);
+                        logger.warn(`No Authorization header found for ${name}`);
                     }
 
                     // Force User-Agent to avoid WAF 400 errors (node-eventsource default might be blocked)
@@ -725,9 +726,9 @@ export class MCPClientService {
                         const isHttpError = fullErrorText.includes('400') || fullErrorText.includes('401') || fullErrorText.includes('403') || fullErrorText.includes('404') || fullErrorText.includes('Non-200');
 
                         if (isHttpError) {
-                            console.warn(`[MCP] Connection refused for ${name}: ${errorStr}`);
+                            logger.warn(`Connection refused for ${name}: ${errorStr}`);
                         } else {
-                            console.error(`[MCP] Transport error for ${name}:`, err);
+                            logger.error(`Transport error for ${name}:`, err);
                         }
 
                         // Handle different error types
@@ -746,10 +747,10 @@ export class MCPClientService {
                     };
 
 
-                    console.log(`[MCP] HTTP/SSE transport created for ${name}, connection initiated...`);
+                    logger.debug(`HTTP/SSE transport created for ${name}, connection initiated...`);
 
                 } catch (httpError: any) {
-                    console.warn(`[MCP] Failed to initiate HTTP transport for ${name}: ${httpError.message}`);
+                    logger.warn(`Failed to initiate HTTP transport for ${name}: ${httpError.message}`);
                     this.updateStatus(name, 'error', `Failed to create transport: ${httpError.message}`, config);
                     // Do not re-throw, just fail gracefully
                 }
@@ -775,12 +776,12 @@ export class MCPClientService {
                 }
 
                 if (missingKey) {
-                    console.log(`[MCP] Skipping connection to ${name}: Missing API Key in ENV.`);
+                    logger.debug(`Skipping connection to ${name}: Missing API Key in ENV.`);
                     this.updateStatus(name, 'error', 'Missing API Key: API Key not configured in Settings.');
                     return;
                 }
 
-                console.log(`[MCP] Connecting to ${name} with command: ${workingConfig.command} ${workingConfig.args?.join(' ')}`);
+                logger.debug(`Connecting to ${name} with command: ${workingConfig.command} ${workingConfig.args?.join(' ')}`);
                 transport = new StdioClientTransport({
                     command: workingConfig.command,
                     args: workingConfig.args || [],
@@ -790,7 +791,7 @@ export class MCPClientService {
 
             // Transport Error Handling
             transport.onerror = (err: any) => {
-                console.error(`[MCP] Transport error for ${name}:`, err);
+                logger.error(`Transport error for ${name}:`, err);
                 this.updateStatus(name, 'error', `Transport Error: ${err.message}`);
             };
 
@@ -813,7 +814,7 @@ export class MCPClientService {
             await client.connect(transport);
             this.clients.set(name, client);
             this.updateStatus(name, 'connected');
-            console.log(`[MCP] Connected to MCP server: ${name}`);
+            logger.debug(`Connected to MCP server: ${name}`);
         } catch (e: any) {
             const errorStr = String(e);
             const jsonError = JSON.stringify(e);
@@ -822,9 +823,9 @@ export class MCPClientService {
             const isHttpError = fullErrorText.includes('400') || fullErrorText.includes('401') || fullErrorText.includes('403') || fullErrorText.includes('404') || fullErrorText.includes('Non-200');
 
             if (isHttpError) {
-                console.warn(`[MCP] Failed to connect to ${name}: ${errorStr}`);
+                logger.warn(`Failed to connect to ${name}: ${errorStr}`);
             } else {
-                console.error(`[MCP] Failed to connect to MCP server ${name}:`, e);
+                logger.error(`Failed to connect to MCP server ${name}:`, e);
             }
 
             // More descriptive error
@@ -920,7 +921,7 @@ export class MCPClientService {
         // 2. Try Shell Command Parsing
         // Safety: If input starts with '{', it was meant to be JSON but failed. fail early.
         if (input.startsWith('{')) {
-            console.warn('[MCP] Input looks like JSON but failed parsing. Aborting shell command check.');
+            logger.warn('[MCP] Input looks like JSON but failed parsing. Aborting shell command check.');
             return [];
         }
 
@@ -971,7 +972,7 @@ export class MCPClientService {
     }
 
     async diagnoseServer(name: string, config: MCPServerConfig): Promise<{ success: boolean; message: string; details?: any }> {
-        console.log(`[MCP] Diagnosing server: ${name}`);
+        logger.debug(`Diagnosing server: ${name}`);
 
         try {
             if (config.type === 'http' || config.type === 'sse') {
@@ -1061,8 +1062,8 @@ export class MCPClientService {
         // Clear and rebuild the mapping
         this.toolNameMapping.clear();
 
-        console.log(`[MCP] Getting tools from ${this.clients.size} connected servers...`);
-        console.log(`[MCP] Connected servers: ${Array.from(this.clients.keys()).join(', ')}`);
+        logger.debug(`Getting tools from ${this.clients.size} connected servers...`);
+        logger.debug(`Connected servers: ${Array.from(this.clients.keys()).join(', ')}`);
 
         // Parallelize and timeout tool fetching
         const toolPromises = Array.from(this.clients.entries()).map(async ([name, client]) => {
@@ -1094,7 +1095,7 @@ export class MCPClientService {
                     };
                 });
             } catch (e: any) {
-                console.error(`Error listing tools for ${name}: ${e.message}`);
+                logger.error(`Error listing tools for ${name}: ${e.message}`);
                 // Update status if it looks like a connection drop
                 if (e.message.includes('Timeout') || e.message.includes('closed')) {
                     this.updateStatus(name, 'error', `Tool listing failed: ${e.message}`);
@@ -1106,15 +1107,15 @@ export class MCPClientService {
         const results = await Promise.all(toolPromises);
         results.forEach(tools => allTools.push(...tools));
 
-        console.log(`[MCP] Total tools loaded: ${allTools.length}`);
+        logger.debug(`Total tools loaded: ${allTools.length}`);
         if (allTools.length > 0) {
-            console.log(`[MCP] Sample tools:`, allTools.slice(0, 3).map(t => t.name));
+            logger.debug(`Sample tools:`, allTools.slice(0, 3).map(t => t.name));
 
             // Log all tool names to find the problematic one
-            console.log(`[MCP] All tool names:`);
+            logger.debug(`All tool names:`);
             allTools.forEach((tool, index) => {
                 const isValid = /^[a-zA-Z0-9_-]+$/.test(tool.name);
-                console.log(`  [${index}] ${tool.name} ${isValid ? '✓' : '❌ INVALID'}`);
+                logger.debug(`  [${index}] ${tool.name} ${isValid ? '✓' : '❌ INVALID'}`);
             });
         }
 
