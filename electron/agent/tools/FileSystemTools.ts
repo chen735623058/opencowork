@@ -1,4 +1,5 @@
 import fs from 'fs/promises';
+import logger from '../../services/Logger';
 import path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -93,7 +94,7 @@ export class FileSystemTools {
         const timeout = 60000; // 60 second timeout
 
         try {
-            console.log(`[FileSystemTools] Executing command: ${args.command} in ${workingDir}`);
+            logger.debug(`Executing command: ${args.command} in ${workingDir}`);
             const { stdout, stderr } = await execAsync(args.command, {
                 cwd: workingDir,
                 timeout: timeout,
